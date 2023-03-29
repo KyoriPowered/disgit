@@ -1,34 +1,46 @@
+import { Env, BoundEnv } from './env';
+import {truncate, shortCommit, validateRequest} from './util';
+
+// originally from
+// https://github.com/JRoy/disgit/blob/3fbe31415f4aaabb4510d17dd7f9029b95218770/disgit.js
+// heavily modified and wrangler-ified
+
 // If true, will send paste of embed json to discord for debugging
 const debug = false;
 
 // Handles event sent by cloudflare
-addEventListener('fetch', function(event) {
-    const { request } = event
-    const response = handleRequest(request).catch(handleError)
-    event.respondWith(response)
-})
-
-async function handleRequest(request) {
+async function handleRequest(request: Request, env: BoundEnv): Promise<Response> {
     const event = request.headers.get("X-GitHub-Event");
     const contentType = request.headers.get("content-type");
-    if (event != null && contentType != null && contentType.includes("application/json")) {
-        let json = await request.json();
-        let embed = buildEmbed(json, event);
+    if (event != null && contentType != null) {
+        /*if (!(await validateRequest(request, env.githubWebhookSecret))) {
+            return new Response('Invalid secret', { status: 403 });
+        }*/
+        let json: any;
+        if (contentType.includes("application/json")) {
+            json = await request.json();
+        } else if (contentType.includes("application/x-www-form-urlencoded")) {
+            json = JSON.parse((await request.formData()).get("payload") as string);
+        } else {
+            return new Response(`Unknown content type ${contentType}`, { status: 400 });
+        }
+
+        let embed = buildEmbed(json, event, env);
         if (embed == null) {
             return new Response('Webhook NO-OP', {status: 200})
         }
 
         if (debug) {
-            embed = await buildDebugPaste(embed);
+            embed = await env.buildDebugPaste(embed);
         }
 
-        let hookSplit = request.url.split("workers.dev/")[1].split("/");
-        if (hookSplit.length === 1) {
+        const url = new URL(request.url)
+        let hookSplit = url.pathname.substring(1).split("/");
+        let [hookId, hookToken] = hookSplit;
+
+        if (typeof(hookToken) == 'undefined') {
             return new Response('Missing Webhook Authorization', { status: 400 });
         }
-
-        let hookId = hookSplit[0];
-        let hookToken = hookSplit[1];
 
         await fetch(`https://discord.com/api/webhooks/${hookId}/${hookToken}`, {
             headers: {
@@ -37,7 +49,7 @@ async function handleRequest(request) {
             method: "POST",
             body: embed
         })
-        return new Response(`Webhook ${hookId} executed with token ${hookToken}`, {status: 200})
+        return new Response(`We won! Webhook ${hookId} executed with token ${hookToken} :3`, {status: 200})
     } else {
         return new Response('Bad Request', { status: 400 })
     }
@@ -48,7 +60,7 @@ async function handleRequest(request) {
  * @param {string} event
  * @return {String|null}
  */
-function buildEmbed(json, event) {
+function buildEmbed(json: any, event: string, env: BoundEnv): string | null {
     const { action } = json;
 
     switch (event) {
@@ -56,31 +68,31 @@ function buildEmbed(json, event) {
             if (action !== "completed") {
                 break;
             }
-            return buildCheck(json);
+            return buildCheck(json, env);
         }
         case "commit_comment": {
             if (action !== "created") {
                 break;
             }
-            return buildCommitComment(json);
+            return buildCommitComment(json, env);
         }
         case "create": {
-            return buildCreateBranch(json);
+            return buildCreateBranch(json, env);
         }
         case "delete": {
-            return buildDeleteBranch(json);
+            return buildDeleteBranch(json, env);
         }
         case "discussion": {
             if (action !== "created") {
                 break;
             }
-            return buildDiscussion(json);
+            return buildDiscussion(json, env);
         }
         case "discussion_comment": {
             if (action !== "created") {
                 break;
             }
-            return buildDiscussionComment(json);
+            return buildDiscussionComment(json, env);
         }
         case "fork": {
             return buildFork(json);
@@ -89,12 +101,12 @@ function buildEmbed(json, event) {
             if (action !== "created") {
                 break;
             }
-            return buildIssueComment(json);
+            return buildIssueComment(json, env);
         }
         case "issues": {
             switch (action) {
                 case "opened": {
-                    return buildIssue(json);
+                    return buildIssue(json, env);
                 }
                 case "reopened": {
                     return buildIssueReOpen(json);
@@ -108,12 +120,13 @@ function buildEmbed(json, event) {
             }
         }
         case "ping": {
-            return buildPing(json);
+            return null;
+            // return buildPing(json);
         }
         case "pull_request": {
             switch (action) {
                 case "opened": {
-                    return buildPull(json);
+                    return buildPull(json, env);
                 }
                 case "closed": {
                     return buildPullClose(json);
@@ -150,7 +163,7 @@ function buildEmbed(json, event) {
             return buildPullReviewComment(json);
         }
         case "push": {
-            return buildPush(json);
+            return buildPush(json, env);
         }
         case "release": {
             if (action === "released" || action === "prereleased") {
@@ -240,13 +253,17 @@ function buildRelease(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildPush(json) {
+function buildPush(json, env: BoundEnv) {
     const { commits, forced, after, repository, ref, compare, sender } = json;
 
     let branch = ref.substring(11);
 
-    if (isIgnoredBranch(branch)) {
+    if (env.isIgnoredBranch(branch)) {
         return null;
+    }
+
+    if (env.isIgnoredUser(sender["login"])) {
+      return null;
     }
 
     if (forced) {
@@ -476,10 +493,10 @@ function buildPullClose(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildPull(json) {
+function buildPull(json, env: BoundEnv) {
     const { pull_request, repository, sender } = json;
 
-    if (isIgnoredUser(sender["login"])) {
+    if (env.isIgnoredUser(sender["login"])) {
         return null;
     }
 
@@ -508,10 +525,10 @@ function buildPull(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildIssueComment(json) {
+function buildIssueComment(json, env: BoundEnv) {
     const { issue, comment, repository, sender } = json;
 
-    if (isIgnoredUser(sender["login"])) {
+    if (env.isIgnoredUser(sender["login"])) {
         return null;
     }
 
@@ -561,7 +578,7 @@ function buildIssueClose(json) {
  * @param {*} json
  * @return {string}
  */
-function buildIssueReOpen(json) {
+function buildIssueReOpen(json: any): string {
     const { issue, repository, sender } = json;
 
     return JSON.stringify({
@@ -584,10 +601,10 @@ function buildIssueReOpen(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildIssue(json) {
+function buildIssue(json: any, env: BoundEnv): string | null {
     const { issue, repository, sender } = json;
 
-    if (isIgnoredUser(sender["login"])) {
+    if (env.isIgnoredUser(sender["login"])) {
         return null;
     }
 
@@ -635,11 +652,11 @@ function buildFork(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildDiscussionComment(json) {
+function buildDiscussionComment(json: any, env: BoundEnv): string | null {
     const { discussion, comment, repository, sender } = json;
     const { category } = discussion;
 
-    if (isIgnoredUser(sender["login"])) {
+    if (env.isIgnoredUser(sender["login"])) {
         return null;
     }
 
@@ -667,11 +684,11 @@ function buildDiscussionComment(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildDiscussion(json) {
+function buildDiscussion(json: any, env: BoundEnv): string | null {
     const { discussion, repository, sender } = json;
     const { category } = discussion;
 
-    if (isIgnoredUser(sender["login"])) {
+    if (env.isIgnoredUser(sender["login"])) {
         return null;
     }
 
@@ -699,8 +716,13 @@ function buildDiscussion(json) {
  * @param {*} json
  * @return {string}
  */
-function buildDeleteBranch(json) {
+function buildDeleteBranch(json: any, env: BoundEnv): string | null {
     const { ref, ref_type, repository, sender } = json;
+
+    if (ref_type == "branch" && env.isIgnoredBranch(ref)) {
+        return null;
+    }
+
 
     return JSON.stringify({
         "embeds": [
@@ -721,8 +743,16 @@ function buildDeleteBranch(json) {
  * @param {*} json
  * @return {string}
  */
-function buildCreateBranch(json) {
+function buildCreateBranch(json: any, env: BoundEnv): string | null {
     const { ref, ref_type, repository, sender } = json;
+
+    if (env.isIgnoredUser(sender["login"])) {
+        return null;
+    }
+
+    if (ref_type == "branch" && env.isIgnoredBranch(ref)) {
+        return null;
+    }
 
     return JSON.stringify({
         "embeds": [
@@ -743,10 +773,10 @@ function buildCreateBranch(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildCommitComment(json) {
+function buildCommitComment(json: any, env: BoundEnv): string | null {
     const { sender, comment, repository } = json;
 
-    if (isIgnoredUser(sender["login"])) {
+    if (env.isIgnoredUser(sender["login"])) {
         return null;
     }
 
@@ -771,7 +801,7 @@ function buildCommitComment(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildCheck(json) {
+function buildCheck(json: any, env: BoundEnv): string | null {
     const { check_run, repository, sender } = json;
     const { conclusion, output, html_url, check_suite } = check_run;
 
@@ -781,7 +811,7 @@ function buildCheck(json) {
 
     let target = check_suite["head_branch"];
 
-    if (isIgnoredBranch(target)) {
+    if (env.isIgnoredBranch(target)) {
         return null;
     }
 
@@ -852,7 +882,7 @@ function buildCheck(json) {
  * @param {*} json
  * @return {string}
  */
-function buildStar(json) {
+function buildStar(json: any): string {
     const { sender, repository } = json;
 
     return JSON.stringify({
@@ -944,7 +974,7 @@ function buildDeploymentStatus(json) {
  * @param {*} json
  * @return {string|null}
  */
-function buildWiki(json) {
+function buildWiki(json: any): string | null {
     const { pages, sender, repository } = json;
 
     // Pages is always an array with several "actions".
@@ -952,7 +982,7 @@ function buildWiki(json) {
     // Also store the titles of the pages in an array since we will need them later.
     let created = 0;
     let edited = 0;
-    let titles = [];
+    let titles: string[] = [];
     for (let i = 0; i < pages.length; i++) {
         const { action } = pages[i];
         if (action === "created") {
@@ -1017,92 +1047,12 @@ function buildWiki(json) {
     });
 }
 
-async function buildDebugPaste(embed) {
-    embed = JSON.stringify({
-        "files": [
-            {
-                "content": {
-                    "format": "text",
-                    "value": embed
-                }
-            }
-        ]
-    });
-
-    embed = await (await fetch("https://api.paste.gg/v1/pastes", {
-        headers: {
-            "user-agent": "EssentialsX plugin",
-            "content-type": "application/json"
-        },
-        method: "POST",
-        body: embed
-    })).text();
-
-    embed = JSON.stringify({
-        "content": embed
-    });
-    return embed;
-}
-
-/**
- * @param {String} branch
- * @return {boolean}
- */
-function isIgnoredBranch(branch) {
-    // noinspection JSUnresolvedVariable
-    if (typeof IGNORED_BRANCHES === 'undefined' || IGNORED_BRANCHES == null) {
-        return false;
-    }
-
-    // noinspection JSUnresolvedVariable
-    return IGNORED_BRANCHES.split(",").includes(branch);
-}
-
-/**
- * @param {String} user
- * @return {boolean}
- */
-function isIgnoredUser(user) {
-    // noinspection JSUnresolvedVariable
-    if (typeof IGNORED_USERS === 'undefined' || IGNORED_USERS == null) {
-        return false;
-    }
-
-    // noinspection JSUnresolvedVariable
-    return IGNORED_USERS.split(",").includes(user);
-}
-
-/**
- * @param {String} str
- * @param {Number} num
- * @return {string|null}
- */
-function truncate(str, num) {
-    if (str === null) {
-        return null;
-    }
-
-    str = str.replace(/<!--(?:.|\n|\r)*?-->[\n|\r]*/g, "");
-    if (str.length <= num) {
-        return str;
-    }
-    return str.slice(0, num - 3) + "...";
-}
-
-/**
- * @param {String} hash
- * @return {string}
- */
-function shortCommit(hash) {
-    return hash.substring(0, 7);
-}
-
 /**
  * Responds with an uncaught error.
- * @param {Error} error
+ * @param error
  * @returns {Response}
  */
-function handleError(error) {
+function handleError(error: any): Response {
     console.error('Uncaught error:', error)
 
     const { stack } = error
@@ -1113,3 +1063,17 @@ function handleError(error) {
         }
     })
 }
+
+
+
+export default {
+	async fetch(
+		request: Request,
+		env: Env,
+		ctx: ExecutionContext
+	): Promise<Response> {
+		const bound = new BoundEnv(env);
+		const response = handleRequest(request, bound).catch(handleError)
+		return response;
+	},
+};
